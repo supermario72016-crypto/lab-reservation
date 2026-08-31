@@ -1,34 +1,26 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
+from streamlit_gsheets import GSheetsConnection
 from datetime import datetime, date, time
 
-# ================= 1. 資料庫初始化 (新增跨日欄位) =================
-conn = sqlite3.connect('lab_reservations_v2.db', check_same_thread=False)
-c = conn.cursor()
-c.execute('''
-    CREATE TABLE IF NOT EXISTS reservations (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_name TEXT,
-        equipment TEXT,
-        start_date TEXT,
-        start_time TEXT,
-        end_date TEXT,
-        end_time TEXT,
-        specific_details TEXT
-    )
-''')
-conn.commit()
-
-# ================= 2. 網頁標題 =================
+# ================= 網頁基本設定 =================
 st.set_page_config(page_title="實驗室機台預約系統", page_icon="🔬", layout="wide")
-st.title("🔬 實驗室機台預約系統")
+st.title("🔬 實驗室機台預約系統 (雲端版)")
 
-# ================= 3. 新增預約區塊 =================
+# ================= 1. 連線至 Google Sheets =================
+try:
+    # 這裡會自動去讀取 Streamlit Secrets 裡面設定的金鑰與網址
+    conn = st.connection("gsheets", type=GSheetsConnection)
+    # 已經加上 ttl=0，強制每次都抓取試算表最新資料
+    df = conn.read(worksheet="工作表1", ttl=0)
+except Exception as e:
+    st.error("無法連線到 Google Sheets。請確認 Streamlit Secrets 金鑰設定是否正確，並確認已將機器人 Email 加入試算表編輯者！")
+    st.stop()
+
+# ================= 2. 新增預約區塊 =================
 st.header("📝 新增預約")
 
 with st.form("reservation_form"):
-    # 將排版改為左右兩排，方便對照開始與結束
     col1, col2 = st.columns(2)
     
     with col1:
@@ -38,7 +30,6 @@ with st.form("reservation_form"):
         
     with col2:
         equipment = st.selectbox("選擇機台", ["烘箱 (Oven)", "爐管 (Tube Furnace)", "CV (電容電壓量測)"])
-        # 結束日期的最小值設為開始日期，防止選到過去的日子
         end_date = st.date_input("結束日期", min_value=start_date)
         end_time = st.time_input("結束時間", value=time(12, 0))
 
@@ -62,7 +53,6 @@ with st.form("reservation_form"):
     submitted = st.form_submit_button("確認預約")
     
     if submitted:
-        # 將日期與時間合併，才能精準判斷跨日與跨時
         start_datetime = datetime.combine(start_date, start_time)
         end_datetime = datetime.combine(end_date, end_time)
 
@@ -71,27 +61,35 @@ with st.form("reservation_form"):
         elif start_datetime >= end_datetime:
             st.error("結束時間必須晚於開始時間！（請檢查日期或時間）")
         else:
-            # 寫入資料庫
-            c.execute('''
-                INSERT INTO reservations (user_name, equipment, start_date, start_time, end_date, end_time, specific_details)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (user_name, equipment, str(start_date), str(start_time), str(end_date), str(end_time), specific_details))
-            conn.commit()
+            # 準備新寫入的一筆資料
+            new_row = pd.DataFrame([{
+                "預約人": user_name,
+                "機台": equipment,
+                "開始日期": str(start_date),
+                "開始時間": str(start_time),
+                "結束日期": str(end_date),
+                "結束時間": str(end_time),
+                "機台設定與備註": specific_details
+            }])
             
-            # 如果是跨日預約，顯示特別的提示訊息
-            if start_date != end_date:
-                st.success(f"✅ 跨日預約成功！ {user_name} 已預約 {equipment}，從 {start_date} {start_time.strftime('%H:%M')} 到 {end_date} {end_time.strftime('%H:%M')}。")
-            else:
-                st.success(f"✅ 成功預約！ {user_name} 已預約 {equipment} ({start_date})。")
+            # 將新資料加到原本的表格下方
+            updated_df = pd.concat([df, new_row], ignore_index=True)
+            
+            # 覆寫回 Google Sheets
+            conn.update(worksheet="工作表1", data=updated_df)
+            
+            # 清除快取，確保下一秒畫面重整時能抓到最新資料
+            st.cache_data.clear()
+            st.success("✅ 預約成功！資料已同步至實驗室 Google 試算表。")
+            st.rerun()
 
-# ================= 4. 預約紀錄總覽 =================
+# ================= 3. 預約紀錄總覽 =================
 st.markdown("---")
 st.header("📅 目前預約總覽")
 
-df = pd.read_sql_query("SELECT * FROM reservations ORDER BY start_date DESC, start_time ASC", conn)
-
-if not df.empty:
-    df.columns = ["預約編號", "預約人", "機台", "開始日期", "開始時間", "結束日期", "結束時間", "機台設定與備註"]
-    st.dataframe(df.drop(columns=["預約編號"]), use_container_width=True)
+if not df.empty and len(df.columns) >= 7:
+    # 根據開始日期與時間進行排序 (新預約在上)
+    df_sorted = df.sort_values(by=['開始日期', '開始時間'], ascending=[False, True])
+    st.dataframe(df_sorted, use_container_width=True)
 else:
-    st.info("目前還沒有任何預約紀錄。")
+    st.info("目前雲端試算表中還沒有任何預約紀錄。")
